@@ -20,7 +20,17 @@ For example:
 ~/klipper/klippy/extras/ktc_cartographer_z_calibrate.py
 ```
 
-Add the supplied configuration to `printer.cfg` or another included cfg file.
+Add the supplied configuration to `printer.cfg` or another included cfg file:
+
+```text
+[include ktc_cartographer_z_calibrate.cfg]
+```
+
+Optionally, if you want a nozzle wipe before each probe touch, also include the wipe macro:
+
+```text
+[include wipe_nozzle.cfg]
+```
 
 ## Default configuration
 
@@ -38,17 +48,14 @@ Change the `toolN_heater` settings if your printer uses different heater names.
 
 ## Use
 
-Calibrate all tools:
+Calibrate all detected tools against T0:
 
 ```text
 KTC_CARTOGRAPHER_Z_CALIBRATE
 ```
 
-Calibrate one tool against a fresh T0 reference:
-
-```text
-KTC_CARTOGRAPHER_Z_CALIBRATE TOOL=1
-```
+There is currently no per-tool `TOOL=` parameter — every run calibrates the reference
+tool plus every other detected tool in one pass.
 
 Show the last results:
 
@@ -58,25 +65,60 @@ KTC_CARTOGRAPHER_Z_STATUS
 
 ## What it does
 
-1. Heats the bed and all tool heaters at the same time.
-2. Waits for the requested temperatures.
-3. Selects T0 and runs `CARTOGRAPHER_TOUCH_HOME`.
-4. Uses T0 as the zero reference.
-5. Selects each other tool and runs `CARTOGRAPHER_TOUCH_PROBE`.
-6. Calculates each tool's Z delta from T0.
-7. Applies the new `gcode_z_offset` values to the running printer.
-8. Turns the bed and tool heaters off.
-9. Leaves the offsets active in runtime.
+1. Initializes the toolchanger from the physically detected tool if needed.
+2. Calls `T0` to select the reference tool and load the Cartographer touch model.
+3. Heats the bed and all tool heaters at the same time, then waits for every target
+   to stabilize.
+4. Optionally wipes the nozzle (`wipe_gcode`), then selects T0 and runs
+   `CARTOGRAPHER_TOUCH_HOME` as the zero reference.
+5. For each other tool: selects it, optionally wipes the nozzle, and runs
+   `CARTOGRAPHER_TOUCH_PROBE`.
+6. Calculates each tool's Z delta from T0. Aborts with no offsets written if any
+   tool's delta exceeds `max_offset`.
+7. Applies every `gcode_z_offset` at runtime via `apply_offset_gcode`
+   (`SET_TOOL_PARAMETER`).
+8. If `persist_offsets` is enabled (default), also registers each value with
+   Klipper's `configfile`, so `SAVE_CONFIG` writes it into the matching
+   `[tool T{n}]` section at the bottom of `printer.cfg`.
+9. Returns to T0 and turns the bed and tool heaters off.
 
-The module does **not** edit `printer.cfg` automatically.
+An already-active tool is never redundantly reselected — the reselect step is
+skipped entirely if the toolchanger reports that tool as already current, since
+re-issuing a `T{n}` macro for an already-active tool has been observed to corrupt
+this toolchanger's active-tool state.
 
-Use Klipper's normal `SAVE_CONFIG` command or the Mainsail/Fluidd **Save Config** button to persist the offsets.
+## Nozzle wiping
+
+Set `wipe_gcode` to your wipe macro's command (e.g. `WIPE_NOZZLE`) to run it before
+every probe touch, including the reference tool. Leave it blank to disable — this
+is a clean no-op, not an error.
+
+A standalone brush-wipe macro (`wipe_nozzle.cfg` / `WIPE_NOZZLE`) is provided
+separately: it does a back-and-forth drag across a fixed brush position, with no
+purge or extrusion involved. Configure the brush's X/Y/Z position in its
+`_WIPE_NOZZLE_GLOBALS` section before use.
+
+## Persisting offsets
+
+The module does **not** write `printer.cfg` itself, and `SET_TOOL_PARAMETER` alone
+does not either — it only sets the runtime value. With `persist_offsets: True`
+(the default), each measured offset is additionally queued with `configfile.set()`
+against `config_section` / `config_option` (default `tool T{tool}` /
+`gcode_z_offset`). That queued value is only written to disk, and the firmware
+restarted, when you run Klipper's normal `SAVE_CONFIG` command or press the
+Mainsail/Fluidd **Save Config** button.
+
+Set `persist_offsets: False` if you only want runtime-only calibration with no
+`SAVE_CONFIG` queuing.
 
 ## Important
 
-Existing `gcode_z_offset` values are not added to the measurement. The calibration measures the physical difference between the tools and calculates a fresh offset from T0.
+Existing `gcode_z_offset` values are not added to the measurement. The calibration
+measures the physical difference between the tools and calculates a fresh offset
+from T0.
 
-Make sure the printer is homed before starting calibration and verify the probe position is safe.
+Make sure the printer is homed before starting calibration and verify the probe
+position is safe.
 
 ## License
 
