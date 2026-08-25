@@ -29,6 +29,14 @@ class KTCCartographerZCalibrate:
 
         self.reference_tool = config.getint("reference_tool", 0)
 
+        # NEW: was hardcoded to 4 tools everywhere. Set this to however
+        # many tools the printer actually has (T0..T{tool_count-1}).
+        self.tool_count = config.getint(
+            "tool_count",
+            4,
+            minval=1
+        )
+
         self.probe_x = config.getfloat("probe_x", None)
         self.probe_y = config.getfloat("probe_y", None)
 
@@ -87,7 +95,7 @@ class KTCCartographerZCalibrate:
 
         self.tool_heaters = {}
 
-        for tool in range(4):
+        for tool in range(self.tool_count):
             self.tool_heaters[tool] = config.get(
                 "tool%d_heater" % tool,
                 self._default_heater(tool)
@@ -197,7 +205,7 @@ class KTCCartographerZCalibrate:
         if result:
             return sorted(set(result))
 
-        return [0, 1, 2, 3]
+        return list(range(self.tool_count))
 
     def _toolhead(self):
         return self.printer.lookup_object("toolhead")
