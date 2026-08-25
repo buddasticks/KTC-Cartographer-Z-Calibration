@@ -26,10 +26,10 @@ Add the supplied configuration to `printer.cfg` or another included cfg file:
 [include ktc_cartographer_z_calibrate.cfg]
 ```
 
-Optionally, if you want a nozzle wipe before each probe touch, also include the wipe macro:
+Optionally, if you want a nozzle wipe before each probe touch, un comment :
 
 ```text
-[include wipe_nozzle.cfg]
+#wipe_gcode: WIPE_NOZZLE
 ```
 
 ## Default configuration
