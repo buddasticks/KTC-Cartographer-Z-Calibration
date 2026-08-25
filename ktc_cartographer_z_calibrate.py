@@ -1,33 +1,26 @@
 # KTC Cartographer Z Calibration
-# Standalone Klippy extra for automatic multi-tool Z offset calibration.
 #
-# Requires:
-#   - Klipper toolchanger
-#   - Cartographer Touch
+# Automatic multi-tool Z offset calibration using Cartographer Touch.
 #
-# Calibration flow:
-#   1. Heat bed and all tool heaters in parallel.
-#   2. Select T0 and run CARTOGRAPHER_TOUCH_HOME.
-#   3. Treat T0 as the zero reference.
-#   4. Select each remaining tool and run CARTOGRAPHER_TOUCH_PROBE.
-#   5. Calculate tool_delta = tool_contact - T0_contact.
-#   6. Apply the resulting gcode_z_offset values at runtime.
-#   7. Do NOT edit printer.cfg automatically.
-#   8. Turn all heaters off after calibration.
-#   9. Use Klipper SAVE_CONFIG / the Save Config button to persist values.
+# Workflow:
+#   G28
+#   KTC_CARTOGRAPHER_Z_CALIBRATE
 #
-# Default heater mapping for the SV08/KTC-Easy setup:
-#   T0 -> extruder
-#   T1 -> extruder1
-#   T2 -> extruder2
-#   T3 -> extruder3
+#   T0                    -> initializes toolchanger + loads Cartographer model
+#   Heat bed + all tools  -> in parallel
+#   CARTOGRAPHER_TOUCH_HOME
+#   T1 -> touch
+#   T2 -> touch
+#   T3 -> touch
+#   Apply runtime gcode_z_offset values
+#   Return T0
+#   Turn calibration heaters OFF
+#   Leave SAVE_CONFIG pending
 #
 # GPLv3
 
-import os
-
-
 class KTCCartographerZCalibrate:
+
     def __init__(self, config):
         self.config = config
         self.printer = config.get_printer()
@@ -35,6 +28,7 @@ class KTCCartographerZCalibrate:
         self.reactor = self.printer.get_reactor()
 
         self.reference_tool = config.getint("reference_tool", 0)
+
         self.probe_x = config.getfloat("probe_x", None)
         self.probe_y = config.getfloat("probe_y", None)
 
@@ -42,503 +36,1071 @@ class KTCCartographerZCalibrate:
         self.travel_speed = config.getfloat("travel_speed", 100.0, above=0.0)
         self.z_move_speed = config.getfloat("z_move_speed", 10.0, above=0.0)
 
-        self.touch_home_gcode = config.get("touch_home_gcode", "CARTOGRAPHER_TOUCH_HOME")
-        self.touch_probe_gcode = config.get("touch_probe_gcode", "CARTOGRAPHER_TOUCH_PROBE")
-
-        self.max_offset = config.getfloat("max_offset", 3.0, above=0.0)
-        self.tool_calibrate_temperature = config.getfloat(
-            "tool_calibrate_temperature", 145.0, above=0.0
+        self.touch_home_gcode = config.get(
+            "touch_home_gcode",
+            "CARTOGRAPHER_TOUCH_HOME"
         )
-        self.bed_calibrate_temperature = config.getfloat(
-            "bed_calibrate_temperature", 60.0, above=0.0
+
+        self.touch_probe_gcode = config.get(
+            "touch_probe_gcode",
+            "CARTOGRAPHER_TOUCH_PROBE"
         )
-        self.temperature_wait = config.getboolean("temperature_wait", True)
 
-        # Explicit heater mapping.  This avoids relying on tool object names.
-        self.bed_heater_name = config.get("bed_heater", "heater_bed")
-        self.heater_map = {}
-        for tool_no, default_name in (
-            (0, "extruder"),
-            (1, "extruder1"),
-            (2, "extruder2"),
-            (3, "extruder3"),
-        ):
-            self.heater_map[tool_no] = config.get(
-                "tool%d_heater" % tool_no, default_name
-            )
+        # Nozzle wipe macro, run before every probe (reference tool
+        # included). Empty string disables wiping.
+        self.wipe_gcode = config.get(
+            "wipe_gcode",
+            ""
+        )
 
-        # Optional additional mappings, e.g. tool4_heater: extruder4.
-        for tool_no in range(4, 16):
-            value = config.get("tool%d_heater" % tool_no, None)
-            if value is not None:
-                self.heater_map[tool_no] = value
+        self.t0_gcode = config.get("t0_gcode", "T0")
+
+        self.max_offset = config.getfloat(
+            "max_offset",
+            3.0,
+            above=0.0
+        )
 
         self.offset_decimals = config.getint(
-            "offset_decimals", 4, minval=3, maxval=6
+            "offset_decimals",
+            4,
+            minval=3,
+            maxval=6
         )
 
-        self.running = False
+        self.tool_calibrate_temperature = config.getfloat(
+            "tool_calibrate_temperature",
+            145.0,
+            above=0.0
+        )
+
+        self.bed_calibrate_temperature = config.getfloat(
+            "bed_calibrate_temperature",
+            60.0,
+            above=0.0
+        )
+
+        self.bed_heater = config.get(
+            "bed_heater",
+            "heater_bed"
+        )
+
+        self.tool_heaters = {}
+
+        for tool in range(4):
+            self.tool_heaters[tool] = config.get(
+                "tool%d_heater" % tool,
+                self._default_heater(tool)
+            )
+
+        self.apply_offset_gcode = config.get(
+            "apply_offset_gcode",
+            "SET_TOOL_PARAMETER "
+            "T={tool} "
+            "PARAMETER=gcode_z_offset "
+            "VALUE={offset}"
+        )
+
+        # NEW: SET_TOOL_PARAMETER only sets the runtime value -- it does
+        # not register anything with configfile, so SAVE_CONFIG had
+        # nothing to write. persist_offsets additionally calls
+        # configfile.set() for each tool so SAVE_CONFIG appends/updates
+        # the value in printer.cfg's auto-generated bottom section.
+        self.persist_offsets = config.getboolean(
+            "persist_offsets",
+            True
+        )
+
+        # {tool} is substituted with the tool number. Must match the
+        # actual config section header for each tool, e.g. [tool T0].
+        self.config_section = config.get(
+            "config_section",
+            "tool T{tool}"
+        )
+
+        self.config_option = config.get(
+            "config_option",
+            "gcode_z_offset"
+        )
+
+        # How long to poll for the toolchanger to confirm an actual
+        # tool change before giving up. Only used when a real reselect
+        # was issued (see _select_tool).
+        self.select_tool_timeout = config.getfloat(
+            "select_tool_timeout",
+            2.0,
+            above=0.0
+        )
+
         self.last_reference_z = None
         self.last_results = {}
         self.last_run_success = False
+        self.running = False
+        self.heaters_started = False
 
         self.gcode.register_command(
             "KTC_CARTOGRAPHER_Z_CALIBRATE",
             self.cmd_CALIBRATE,
-            desc="Automatically calibrate tool Z offsets using Cartographer Touch",
+            desc="Calibrate tool Z offsets using Cartographer Touch"
         )
+
         self.gcode.register_command(
             "KTC_CARTOGRAPHER_Z_STATUS",
             self.cmd_STATUS,
-            desc="Show last KTC Cartographer Z calibration results",
+            desc="Show Cartographer Z calibration status"
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _get_toolchanger(self):
+    @staticmethod
+    def _default_heater(tool):
+        if tool == 0:
+            return "extruder"
+        return "extruder%d" % tool
+
+    def _tool_numbers(self):
         tc = self.printer.lookup_object("toolchanger", None)
+
         if tc is None:
-            raise self.gcode.error("KTC Cartographer Z Calibration requires [toolchanger].")
-        return tc
+            raise self.gcode.error(
+                "KTC Cartographer Z Calibration requires [toolchanger]."
+            )
 
-    def _get_toolhead(self):
-        return self.printer.lookup_object("toolhead")
-
-    def _get_cartographer(self):
-        obj = self.printer.lookup_object("cartographer", None)
-        if obj is None:
-            raise self.gcode.error("KTC Cartographer Z Calibration requires Cartographer.")
-        return obj
-
-    def _get_tool_numbers(self):
-        tc = self._get_toolchanger()
         numbers = getattr(tc, "tool_numbers", None)
-        if numbers is not None:
+
+        if numbers:
             try:
-                result = sorted(set(int(x) for x in numbers if int(x) >= 0))
-                if result:
-                    return result
+                return sorted(
+                    set(int(x) for x in numbers if int(x) >= 0)
+                )
             except Exception:
                 pass
 
-        tools = []
+        result = []
+
         for name in self.printer.lookup_objects():
             if not name.startswith("tool T"):
                 continue
+
             try:
-                tool = self.printer.lookup_object(name)
-                number = int(getattr(tool, "tool_number"))
+                obj = self.printer.lookup_object(name)
+                number = int(obj.tool_number)
+
                 if number >= 0:
-                    tools.append(number)
+                    result.append(number)
+
             except Exception:
                 pass
-        return sorted(set(tools))
 
-    def _get_tool_object(self, tool_no):
-        for name in ("tool T%d" % tool_no, "tool%d" % tool_no, "T%d" % tool_no):
-            obj = self.printer.lookup_object(name, None)
-            if obj is not None:
-                return obj
-        return None
+        if result:
+            return sorted(set(result))
 
-    def _get_current_tool(self):
-        for tool_no in self._get_tool_numbers():
-            tool = self._get_tool_object(tool_no)
-            if tool is None:
-                continue
-            if getattr(tool, "active", False):
-                return tool_no
-            if hasattr(tool, "get_status"):
-                try:
-                    status = tool.get_status(self.reactor.monotonic())
-                    if isinstance(status, dict) and status.get("active", False):
-                        return tool_no
-                except Exception:
-                    pass
-        return -1
+        return [0, 1, 2, 3]
 
-    def _read_cartographer_result(self):
-        cartographer = self._get_cartographer()
-        now = self.reactor.monotonic()
+    def _toolhead(self):
+        return self.printer.lookup_object("toolhead")
 
+    def _cartographer(self):
+        obj = self.printer.lookup_object("cartographer", None)
+
+        if obj is None:
+            raise self.gcode.error(
+                "Cartographer is not loaded."
+            )
+
+        return obj
+
+    def _current_tool(self):
+        tc = self.printer.lookup_object("toolchanger", None)
+
+        if tc is None:
+            return -1
+
+        # FIX: prefer get_status(). Confirmed via the object/status
+        # panel that "tool_number" is reliably populated there, but
+        # plain getattr(tc, "tool_number") was returning stale/None
+        # values, which made the "already active" check below always
+        # fail and re-issue the T-macro even when a tool was already
+        # selected -- and that redundant reselect is what corrupts
+        # this toolchanger back to "uninitialized" / tool_number -1.
         try:
-            status = cartographer.get_status(now)
+            status = tc.get_status(self.reactor.monotonic())
+
             if isinstance(status, dict):
-                touch = status.get("touch")
-                if isinstance(touch, dict) and touch.get("last_z_result") is not None:
-                    return float(touch["last_z_result"])
-                if status.get("last_z_result") is not None:
-                    return float(status["last_z_result"])
+                value = status.get("tool_number")
+
+                if value is not None:
+                    value = int(value)
+
+                    if value >= 0:
+                        return value
+
         except Exception:
             pass
 
-        for obj_name in ("scanner",):
-            obj = self.printer.lookup_object(obj_name, None)
-            if obj is None:
+        for attr in (
+            "tool_number",
+            "active_tool",
+            "current_tool"
+        ):
+            value = getattr(tc, attr, None)
+
+            if value is None:
                 continue
+
             try:
-                status = obj.get_status(now)
-                if isinstance(status, dict) and status.get("last_z_result") is not None:
-                    return float(status["last_z_result"])
+                value = int(value)
+
+                if value >= 0:
+                    return value
+
             except Exception:
                 pass
-            try:
-                if hasattr(obj, "last_z_result"):
-                    return float(obj.last_z_result)
-            except Exception:
-                pass
+
+        return -1
+
+    # ------------------------------------------------------------------
+    # Toolchanger initialization
+    # ------------------------------------------------------------------
+
+    def _initialize_toolchanger(self):
+        """
+        T0 is deliberately called first.
+
+        The T0 macro performs:
+            SELECT_TOOL T=0
+            CARTO_TOUCH_MODEL ACTION=load NAME=t0
+
+        If the toolchanger is uninitialized after G28, SELECT_TOOL can fail.
+        Therefore initialise from the physically detected tool first.
+        """
+
+        tc = self.printer.lookup_object("toolchanger", None)
+
+        if tc is None:
+            raise self.gcode.error(
+                "Toolchanger object not found."
+            )
+
+        initialized = getattr(tc, "initialized", None)
+
+        if initialized is True:
+            return
+
+        status = None
 
         try:
-            return float(cartographer.last_z_result)
+            status = tc.get_status(
+                self.reactor.monotonic()
+            )
         except Exception:
-            return None
+            pass
 
-    def _run_gcode(self, script):
-        self.gcode.run_script_from_command(script)
-        self._get_toolhead().wait_moves()
+        if isinstance(status, dict):
+            if status.get("initialized") is True:
+                return
+
+        self.gcode.respond_info(
+            "Initializing toolchanger from detected tool..."
+        )
+
+        self.gcode.run_script_from_command(
+            "_INITIALIZE_FROM_DETECTED_TOOL"
+        )
+
+        self._toolhead().wait_moves()
+
+        self.reactor.pause(
+            self.reactor.monotonic() + 0.05
+        )
+
+    def _select_tool(self, tool):
+        # FIX: if this tool is already the active tool, do NOT re-issue
+        # the T-macro. On this toolchanger, re-selecting an already-
+        # active tool takes an "already selected" shortcut path that
+        # does not fully re-run the pickup/selection sequence, which
+        # was observed to leave the reported active tool at -1
+        # afterwards (see log: "Tool tool T0 already selected" followed
+        # by "active tool is T-1"). Skipping the redundant reselect
+        # avoids that broken path entirely and is a no-op otherwise.
+        if self._current_tool() == tool:
+            self.gcode.respond_info(
+                "T%d already active, skipping reselect." % tool
+            )
+            return
+
+        self.gcode.respond_info(
+            "Selecting T%d..." % tool
+        )
+
+        self._lift()
+
+        self.gcode.run_script_from_command(
+            "T%d" % tool
+        )
+
+        self._toolhead().wait_moves()
+
+        # FIX: poll for the toolchanger to confirm the new active tool
+        # instead of relying on a single fixed 0.05s pause, since state
+        # propagation timing can vary between toolchanges.
+        selected = -1
+        deadline = self.reactor.monotonic() + self.select_tool_timeout
+
+        while self.reactor.monotonic() < deadline:
+            self.reactor.pause(
+                self.reactor.monotonic() + 0.1
+            )
+
+            selected = self._current_tool()
+
+            if selected == tool:
+                break
+
+        if selected != tool:
+            raise self.gcode.error(
+                "T%d selection failed; active tool is T%d."
+                % (tool, selected)
+            )
+
+    # ------------------------------------------------------------------
+    # Motion
+    # ------------------------------------------------------------------
 
     def _is_homed(self):
         try:
-            status = self._get_toolhead().get_status(self.reactor.monotonic())
+            status = self._toolhead().get_status(
+                self.reactor.monotonic()
+            )
+
             homed = status.get("homed_axes", "")
-            return all(axis in homed for axis in ("x", "y", "z"))
+
+            return (
+                "x" in homed
+                and "y" in homed
+                and "z" in homed
+            )
+
         except Exception:
             return False
 
     def _lift(self):
-        toolhead = self._get_toolhead()
-        pos = toolhead.get_position()
-        if pos[2] < self.lift_z:
-            toolhead.manual_move([None, None, self.lift_z], self.z_move_speed)
+        toolhead = self._toolhead()
+        position = toolhead.get_position()
+
+        if position[2] < self.lift_z:
+            toolhead.manual_move(
+                [None, None, self.lift_z],
+                self.z_move_speed
+            )
+
         toolhead.wait_moves()
 
     def _move_to_probe_position(self):
         if self.probe_x is None or self.probe_y is None:
             return
-        toolhead = self._get_toolhead()
-        pos = toolhead.get_position()
-        safe_z = max(float(pos[2]), self.lift_z)
-        toolhead.manual_move([None, None, safe_z], self.z_move_speed)
-        toolhead.manual_move([self.probe_x, self.probe_y, None], self.travel_speed)
+
+        toolhead = self._toolhead()
+        position = toolhead.get_position()
+
+        safe_z = max(
+            float(position[2]),
+            self.lift_z
+        )
+
+        toolhead.manual_move(
+            [None, None, safe_z],
+            self.z_move_speed
+        )
+
+        toolhead.manual_move(
+            [self.probe_x, self.probe_y, None],
+            self.travel_speed
+        )
+
         toolhead.wait_moves()
 
-    def _select_tool(self, tool_no):
-        current = self._get_current_tool()
-        if current == tool_no:
-            self.gcode.respond_info("T%d is already selected." % tool_no)
+    def _wipe(self):
+        if not self.wipe_gcode:
             return
 
-        self._lift()
-        self.gcode.respond_info("Selecting T%d..." % tool_no)
-        self._run_gcode("T%d" % tool_no)
+        self.gcode.respond_info(
+            "Wiping nozzle..."
+        )
 
-        selected = self._get_current_tool()
-        if selected != tool_no:
-            self.reactor.pause(self.reactor.monotonic() + 0.10)
-            selected = self._get_current_tool()
-        if selected != tool_no:
-            raise self.gcode.error(
-                "Tool change failed: requested T%d, toolchanger reports T%d."
-                % (tool_no, selected)
-            )
-        self.gcode.respond_info("T%d confirmed active." % tool_no)
+        self.gcode.run_script_from_command(
+            self.wipe_gcode
+        )
+
+        self._toolhead().wait_moves()
 
     # ------------------------------------------------------------------
-    # Heater handling
+    # Cartographer
     # ------------------------------------------------------------------
 
-    def _heater_names(self, tools):
-        return [self.heater_map[t] for t in tools if t in self.heater_map]
+    def _cartographer_result(self):
+        cartographer = self._cartographer()
+        now = self.reactor.monotonic()
 
-    def _find_heater(self, name):
-        # Klipper's heater object registry is the authoritative source.
-        heaters = self.printer.lookup_object("heaters", None)
-        if heaters is not None:
+        try:
+            status = cartographer.get_status(now)
+
+            if isinstance(status, dict):
+
+                touch = status.get("touch")
+
+                if isinstance(touch, dict):
+                    value = touch.get("last_z_result")
+
+                    if value is not None:
+                        return float(value)
+
+                value = status.get("last_z_result")
+
+                if value is not None:
+                    return float(value)
+
+        except Exception:
+            pass
+
+        value = getattr(
+            cartographer,
+            "last_z_result",
+            None
+        )
+
+        if value is not None:
             try:
-                heater = heaters.lookup_heater(name)
-                if heater is not None:
-                    return heater
+                return float(value)
             except Exception:
                 pass
 
-        # Fallback to direct object lookup for installations exposing heaters.
-        return self.printer.lookup_object(name, None)
+        return None
 
-    def _validate_heaters(self, tools):
-        missing = []
-        for tool_no in tools:
-            name = self.heater_map.get(tool_no)
-            if not name or self._find_heater(name) is None:
-                missing.append("T%d=%s" % (tool_no, name or "<unset>"))
-        if self._find_heater(self.bed_heater_name) is None:
-            missing.append("bed=%s" % self.bed_heater_name)
+    def _touch(self):
+        self.gcode.run_script_from_command(
+            self.touch_probe_gcode
+        )
+
+        self._toolhead().wait_moves()
+
+        result = self._cartographer_result()
+
+        if result is None:
+            raise self.gcode.error(
+                "Cartographer did not return a Z result."
+            )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Heaters
+    # ------------------------------------------------------------------
+
+    def _available_heaters(self):
+        heaters = self.printer.lookup_object(
+            "heaters",
+            None
+        )
+
+        if heaters is None:
+            return []
+
+        try:
+            return list(
+                heaters.get_all_heaters()
+            )
+        except Exception:
+            return []
+
+    def _heater_list(self, tools):
+        heaters = [self.bed_heater]
+
+        for tool in tools:
+            heater = self.tool_heaters[tool]
+
+            if heater not in heaters:
+                heaters.append(heater)
+
+        return heaters
+
+    def _check_heaters(self, tools):
+        available = self._available_heaters()
+        required = self._heater_list(tools)
+
+        missing = [
+            heater
+            for heater in required
+            if heater not in available
+        ]
+
         if missing:
             raise self.gcode.error(
-                "Could not find required heater(s): %s" % ", ".join(missing)
+                "Calibration heater(s) not found: %s. "
+                "Available heaters: %s"
+                % (
+                    ", ".join(missing),
+                    ", ".join(available)
+                )
             )
 
-    def _set_temperature(self, heater_name, temp, wait=False):
-        # SET_HEATER_TEMPERATURE works with both standard Klipper heaters and
-        # extruders and does not require us to know their internal classes.
-        self._run_gcode(
-            "SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.1f"
-            % (heater_name, temp)
+    def _set_temperature(self, heater, target):
+        self.gcode.run_script_from_command(
+            "SET_HEATER_TEMPERATURE "
+            "HEATER=%s TARGET=%.1f"
+            % (heater, target)
         )
 
-    def _wait_heater(self, heater_name, target):
-        if not self.temperature_wait or target <= 0:
-            return
-        # TEMPERATURE_WAIT is a Klipper command and waits for the actual heater.
-        self._run_gcode(
-            "TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.1f"
-            % (heater_name, target)
+    def _wait_temperature(self, heater, target):
+        self.gcode.run_script_from_command(
+            "TEMPERATURE_WAIT "
+            "SENSOR=%s MINIMUM=%.1f"
+            % (heater, target)
         )
 
-    def _preheat_all(self, tools):
-        self._validate_heaters(tools)
-        self.gcode.respond_info("========================================")
-        self.gcode.respond_info(" PREHEATING FOR CALIBRATION")
-        self.gcode.respond_info("========================================")
-        self.gcode.respond_info("Bed temperature: %.1f C" % self.bed_calibrate_temperature)
+    def _preheat(self, tools):
+        self._check_heaters(tools)
+
+        self.gcode.respond_info("")
         self.gcode.respond_info(
-            "Tool calibration temperature: %.1f C" % self.tool_calibrate_temperature
+            "========================================"
+        )
+        self.gcode.respond_info(
+            "PREHEATING FOR CALIBRATION"
+        )
+        self.gcode.respond_info(
+            "========================================"
         )
 
-        # Start every heater first so they heat concurrently.
-        self._set_temperature(self.bed_heater_name, self.bed_calibrate_temperature)
-        for tool_no in tools:
+        self.gcode.respond_info(
+            "Bed temperature: %.1f C"
+            % self.bed_calibrate_temperature
+        )
+
+        self.gcode.respond_info(
+            "Tool calibration temperature: %.1f C"
+            % self.tool_calibrate_temperature
+        )
+
+        # Start EVERYTHING before waiting for anything.
+        self._set_temperature(
+            self.bed_heater,
+            self.bed_calibrate_temperature
+        )
+
+        for tool in tools:
+            heater = self.tool_heaters[tool]
+
             self.gcode.respond_info(
                 "Setting T%d calibration temperature to %.1fC..."
-                % (tool_no, self.tool_calibrate_temperature)
-            )
-            self._set_temperature(
-                self.heater_map[tool_no], self.tool_calibrate_temperature
+                % (
+                    tool,
+                    self.tool_calibrate_temperature
+                )
             )
 
-        # Only then wait. This is substantially faster than heating one tool at a time.
-        if self.temperature_wait:
-            self.gcode.respond_info("Waiting for bed to stabilize...")
-            self._wait_heater(self.bed_heater_name, self.bed_calibrate_temperature)
-            for tool_no in tools:
-                self.gcode.respond_info("Waiting for T%d to stabilize..." % tool_no)
-                self._wait_heater(
-                    self.heater_map[tool_no], self.tool_calibrate_temperature
+            self._set_temperature(
+                heater,
+                self.tool_calibrate_temperature
+            )
+
+        self.heaters_started = True
+
+        # Wait for all tools.
+        for tool in tools:
+            heater = self.tool_heaters[tool]
+
+            self.gcode.respond_info(
+                "Waiting for T%d to stabilize..."
+                % tool
+            )
+
+            self._wait_temperature(
+                heater,
+                self.tool_calibrate_temperature
+            )
+
+        self.gcode.respond_info(
+            "Waiting for bed to stabilize..."
+        )
+
+        self._wait_temperature(
+            self.bed_heater,
+            self.bed_calibrate_temperature
+        )
+
+    def _heaters_off(self, tools):
+        if not self.heaters_started:
+            return
+
+        self.gcode.respond_info(
+            "Turning heaters off..."
+        )
+
+        for heater in self._heater_list(tools):
+            try:
+                self._set_temperature(
+                    heater,
+                    0.0
+                )
+            except Exception as e:
+                self.gcode.respond_info(
+                    "Warning: could not turn off %s: %s"
+                    % (heater, e)
                 )
 
-    def _turn_heaters_off(self, tools):
-        self.gcode.respond_info("Turning heaters off...")
-        names = set([self.bed_heater_name])
-        for tool_no in tools:
-            if tool_no in self.heater_map:
-                names.add(self.heater_map[tool_no])
-        for name in names:
-            try:
-                self._set_temperature(name, 0.0)
-            except Exception as e:
-                self.gcode.respond_info("Warning: could not turn off %s: %s" % (name, str(e)))
-
-    # ------------------------------------------------------------------
-    # Runtime offsets
-    # ------------------------------------------------------------------
-
-    def _apply_runtime_offset(self, tool_no, offset):
-        # This is deliberately done through the toolchanger command so the
-        # value is active immediately and SAVE_CONFIG can persist it later.
-        script = (
-            "SET_TOOL_PARAMETER T=%d PARAMETER=gcode_z_offset VALUE=%.6f"
-            % (tool_no, offset)
-        )
-        self._run_gcode(script)
+        self.heaters_started = False
 
     # ------------------------------------------------------------------
     # Calibration
     # ------------------------------------------------------------------
 
-    def _calibrate_reference(self):
-        self._select_tool(self.reference_tool)
+    def _reference(self):
+        self._select_tool(
+            self.reference_tool
+        )
+
+        self._wipe()
+
         self._move_to_probe_position()
-        self.gcode.respond_info("Running %s..." % self.touch_home_gcode)
-        self._run_gcode(self.touch_home_gcode)
-        result = self._read_cartographer_result()
+
+        self.gcode.respond_info(
+            "Running %s..."
+            % self.touch_home_gcode
+        )
+
+        self.gcode.run_script_from_command(
+            self.touch_home_gcode
+        )
+
+        self._toolhead().wait_moves()
+
+        result = self._cartographer_result()
+
         if result is None:
-            raise self.gcode.error("Unable to read Cartographer reference result after %s." % self.touch_home_gcode)
-        self.last_reference_z = result
-        self.gcode.respond_info("T%d is now the ZERO reference." % self.reference_tool)
-        self.gcode.respond_info("T%d Cartographer reference: %.6f mm" % (self.reference_tool, result))
-        return result
-
-    def _calibrate_tool(self, tool_no, reference_z):
-        self._select_tool(tool_no)
-        self._move_to_probe_position()
-        self.gcode.respond_info("T%d: running %s..." % (tool_no, self.touch_probe_gcode))
-        self._run_gcode(self.touch_probe_gcode)
-        measured = self._read_cartographer_result()
-        if measured is None:
-            raise self.gcode.error("T%d did not provide a readable Cartographer Z result." % tool_no)
-
-        delta = measured - reference_z
-        if abs(delta) > self.max_offset:
             raise self.gcode.error(
-                "T%d produced Z delta %.4f mm, exceeding max_offset %.4f mm."
-                % (tool_no, delta, self.max_offset)
+                "Unable to read Cartographer reference."
             )
 
-        result = {
-            "tool": tool_no,
-            "measured_z": measured,
-            "delta": delta,
-            "offset": delta,
-        }
-        self.gcode.respond_info("T%d contact: %.6f mm" % (tool_no, measured))
-        self.gcode.respond_info("T%d delta: %.6f mm" % (tool_no, delta))
-        self.gcode.respond_info("T%d suggested gcode_z_offset: %.6f" % (tool_no, delta))
+        self.last_reference_z = result
+
+        self.gcode.respond_info(
+            "T%d Cartographer reference: %.6f mm"
+            % (
+                self.reference_tool,
+                result
+            )
+        )
+
         return result
 
-    def _run_calibration(self, tools):
+    def _calibrate_tool(self, tool, reference):
+        self._select_tool(tool)
+
+        self._wipe()
+
+        self._move_to_probe_position()
+
+        self.gcode.respond_info(
+            "Touching T%d..."
+            % tool
+        )
+
+        measured = self._touch()
+
+        offset = measured - reference
+
+        if abs(offset) > self.max_offset:
+            raise self.gcode.error(
+                "T%d offset %.4f exceeds max_offset %.4f."
+                % (
+                    tool,
+                    offset,
+                    self.max_offset
+                )
+            )
+
+        self.gcode.respond_info(
+            "T%d contact: %.6f"
+            % (tool, measured)
+        )
+
+        self.gcode.respond_info(
+            "T%d delta: %.6f"
+            % (tool, offset)
+        )
+
+        self.gcode.respond_info(
+            "T%d suggested gcode_z_offset: %.6f"
+            % (tool, offset)
+        )
+
+        return {
+            "tool": tool,
+            "measured_z": measured,
+            "delta": offset,
+            "offset": offset
+        }
+
+    def _apply_offset(self, tool, offset):
+        value = (
+            "%.*f"
+            % (
+                self.offset_decimals,
+                offset
+            )
+        )
+
+        command = self.apply_offset_gcode.format(
+            tool=tool,
+            offset=value
+        )
+
+        self.gcode.run_script_from_command(
+            command
+        )
+
+        self.gcode.respond_info(
+            "T%d runtime gcode_z_offset = %s"
+            % (tool, value)
+        )
+
+        self._persist_offset(tool, value)
+
+    def _persist_offset(self, tool, value):
+        """
+        Register the offset with configfile so SAVE_CONFIG writes it
+        into printer.cfg's auto-generated bottom section. This does
+        NOT write the file itself -- it only queues the value; the
+        user (or a macro) still has to run SAVE_CONFIG / press
+        Save Config to actually commit and restart.
+        """
+
+        if not self.persist_offsets:
+            return
+
+        configfile = self.printer.lookup_object(
+            "configfile",
+            None
+        )
+
+        if configfile is None:
+            self.gcode.respond_info(
+                "Warning: configfile object not found, "
+                "T%d offset was not queued for SAVE_CONFIG."
+                % tool
+            )
+            return
+
+        section = self.config_section.format(tool=tool)
+
+        try:
+            configfile.set(
+                section,
+                self.config_option,
+                value
+            )
+        except Exception as e:
+            self.gcode.respond_info(
+                "Warning: could not queue T%d offset for "
+                "SAVE_CONFIG (section [%s]): %s"
+                % (tool, section, e)
+            )
+
+    # ------------------------------------------------------------------
+    # Main calibration
+    # ------------------------------------------------------------------
+
+    def _run(self, tools):
         self.running = True
         self.last_run_success = False
         self.last_results = {}
+        self.heaters_started = False
+
         try:
             if not self._is_homed():
-                raise self.gcode.error("Printer must be fully homed before Cartographer Z calibration.")
-            if self.reference_tool not in tools:
-                raise self.gcode.error("Reference T%d is not present." % self.reference_tool)
+                raise self.gcode.error(
+                    "Printer must be fully homed before calibration."
+                )
 
-            # Heat everything before doing any tool measurements.
-            self._preheat_all(tools)
+            # IMPORTANT:
+            # G28 does not initialise KTC-Easy's software state.
+            #
+            # This must happen BEFORE T0 is called.
+            self._initialize_toolchanger()
 
-            reference_z = self._calibrate_reference()
-            self.last_results[self.reference_tool] = {
+            # T0 handles:
+            #   SELECT_TOOL T=0
+            #   CARTO_TOUCH_MODEL ACTION=load NAME=t0
+            #
+            # This gives Cartographer the correct model before touching.
+            self.gcode.respond_info(
+                "Calling T0 to initialise reference tool and "
+                "load Cartographer model..."
+            )
+
+            self.gcode.run_script_from_command(
+                self.t0_gcode
+            )
+
+            self._toolhead().wait_moves()
+
+            # Heat all heaters together.
+            self._preheat(tools)
+
+            # Reference measurement.
+            reference = self._reference()
+
+            self.last_results[
+                self.reference_tool
+            ] = {
                 "tool": self.reference_tool,
-                "measured_z": reference_z,
+                "measured_z": reference,
                 "delta": 0.0,
-                "offset": 0.0,
+                "offset": 0.0
             }
 
-            # Measure every non-reference tool.
-            for tool_no in tools:
-                if tool_no == self.reference_tool:
+            # Measure every other tool.
+            for tool in tools:
+                if tool == self.reference_tool:
                     continue
-                self.last_results[tool_no] = self._calibrate_tool(tool_no, reference_z)
 
-            # Nothing is applied until every measurement has passed.
+                self.last_results[tool] = (
+                    self._calibrate_tool(
+                        tool,
+                        reference
+                    )
+                )
+
+            # Do not apply anything until ALL tools passed.
             self.gcode.respond_info("")
-            self.gcode.respond_info("========================================")
-            self.gcode.respond_info(" ALL TOUCH MEASUREMENTS PASSED")
-            self.gcode.respond_info("========================================")
+            self.gcode.respond_info(
+                "========================================"
+            )
+            self.gcode.respond_info(
+                "ALL TOUCH MEASUREMENTS PASSED"
+            )
+            self.gcode.respond_info(
+                "========================================"
+            )
 
-            for tool_no in sorted(self.last_results):
-                offset = self.last_results[tool_no]["offset"]
-                self._apply_runtime_offset(tool_no, offset)
+            for tool in sorted(self.last_results):
+                offset = self.last_results[
+                    tool
+                ]["offset"]
+
                 self.gcode.respond_info(
                     "T%d -> gcode_z_offset = %.*f"
-                    % (tool_no, self.offset_decimals, offset)
+                    % (
+                        tool,
+                        self.offset_decimals,
+                        offset
+                    )
+                )
+
+            for tool in sorted(self.last_results):
+                self._apply_offset(
+                    tool,
+                    self.last_results[tool]["offset"]
                 )
 
             self.last_run_success = True
-            self.gcode.respond_info("========================================")
-            self.gcode.respond_info(" OFFSETS APPLIED TO RUNTIME")
-            self.gcode.respond_info("========================================")
-            self.gcode.respond_info("Use the normal SAVE_CONFIG / Save Config button to persist them.")
-            self.gcode.respond_info("Offsets have NOT been written automatically.")
 
         finally:
-            self._turn_heaters_off(tools)
-            self.gcode.respond_info("========================================")
-            self.gcode.respond_info("Heaters have been turned off.")
-            self.gcode.respond_info("Use SAVE_CONFIG / Save Config to persist them.")
-            self.gcode.respond_info("All calibrated offsets are active.")
-            self.gcode.respond_info("T%d is the reference at 0.0000." % self.reference_tool)
-            self.gcode.respond_info("========================================")
+            self._heaters_off(tools)
             self.running = False
 
     # ------------------------------------------------------------------
-    # Commands
+    # G-code commands
     # ------------------------------------------------------------------
 
     def cmd_CALIBRATE(self, gcmd):
         if self.running:
-            raise gcmd.error("KTC Cartographer Z calibration is already running.")
+            raise gcmd.error(
+                "Calibration is already running."
+            )
 
-        all_tools = self._get_tool_numbers()
-        if not all_tools:
-            raise gcmd.error("No tools were found in the toolchanger.")
+        tools = self._tool_numbers()
 
-        requested = gcmd.get_int("TOOL", default=-1)
-        if requested >= 0:
-            if requested == self.reference_tool:
-                gcmd.respond_info("T%d is the reference tool; nothing else needs calibrating." % requested)
-                return
-            if requested not in all_tools:
-                raise gcmd.error("T%d is not present in the toolchanger." % requested)
-            tools = [self.reference_tool, requested]
-        else:
-            tools = list(all_tools)
+        if self.reference_tool not in tools:
+            raise gcmd.error(
+                "Reference T%d not found."
+                % self.reference_tool
+            )
 
-        self.gcode.respond_info("")
-        self.gcode.respond_info("========================================")
-        self.gcode.respond_info(" KTC CARTOGRAPHER Z CALIBRATION")
-        self.gcode.respond_info("========================================")
-        self.gcode.respond_info("Reference tool: T%d" % self.reference_tool)
-        self.gcode.respond_info("Tools: %s" % ", ".join("T%d" % x for x in tools))
-        self.gcode.respond_info("Existing gcode_z_offset values are NOT used in the measurement.")
-        self.gcode.respond_info("Bed temperature: %.1f C" % self.bed_calibrate_temperature)
-        self.gcode.respond_info("Tool calibration temperature: %.1f C" % self.tool_calibrate_temperature)
-        self.gcode.respond_info("")
+        gcmd.respond_info("")
+        gcmd.respond_info(
+            "========================================"
+        )
+        gcmd.respond_info(
+            "KTC_CARTOGRAPHER_Z_CALIBRATE"
+        )
+        gcmd.respond_info(
+            "========================================"
+        )
+        gcmd.respond_info(
+            "Tools: %s"
+            % ", ".join(
+                "T%d" % x
+                for x in tools
+            )
+        )
+        gcmd.respond_info(
+            "Reference tool: T%d"
+            % self.reference_tool
+        )
+        gcmd.respond_info(
+            "Existing gcode_z_offset values are "
+            "NOT used in the measurement."
+        )
+        gcmd.respond_info(
+            "Bed temperature: %.1f C"
+            % self.bed_calibrate_temperature
+        )
+        gcmd.respond_info(
+            "Tool calibration temperature: %.1f C"
+            % self.tool_calibrate_temperature
+        )
 
         try:
-            self._run_calibration(tools)
+            self._run(tools)
+
         except Exception:
             self.last_run_success = False
-            self.gcode.respond_info("")
-            self.gcode.respond_info("========================================")
-            self.gcode.respond_info(" NO OFFSETS WERE WRITTEN")
-            self.gcode.respond_info(" CALIBRATION ABORTED")
-            self.gcode.respond_info("========================================")
-            try:
-                self._lift()
-            except Exception:
-                pass
-            try:
-                self._select_tool(self.reference_tool)
-            except Exception:
-                pass
+
+            gcmd.respond_info("")
+            gcmd.respond_info(
+                "========================================"
+            )
+            gcmd.respond_info(
+                "CALIBRATION ABORTED"
+            )
+            gcmd.respond_info(
+                "NO OFFSETS WERE WRITTEN"
+            )
+            gcmd.respond_info(
+                "========================================"
+            )
+
             raise
 
+        # Return to T0 before finishing.
         try:
             self._lift()
-            self._select_tool(self.reference_tool)
+
+            current = self._current_tool()
+
+            if current != self.reference_tool:
+                self._select_tool(
+                    self.reference_tool
+                )
+
         except Exception as e:
-            self.gcode.respond_info(
-                "Warning: calibration succeeded but could not return to T%d: %s"
-                % (self.reference_tool, str(e))
+            gcmd.respond_info(
+                "Warning: could not return to T%d: %s"
+                % (
+                    self.reference_tool,
+                    e
+                )
             )
 
-        self.gcode.respond_info("")
-        self.gcode.respond_info("========================================")
-        self.gcode.respond_info(" CARTOGRAPHER Z CALIBRATION COMPLETE")
-        self.gcode.respond_info("========================================")
+        gcmd.respond_info("")
+        gcmd.respond_info(
+            "========================================"
+        )
+        gcmd.respond_info(
+            "CARTOGRAPHER Z CALIBRATION COMPLETE"
+        )
+        gcmd.respond_info(
+            "========================================"
+        )
+        gcmd.respond_info(
+            "T%d is the reference at 0.0000."
+            % self.reference_tool
+        )
+        gcmd.respond_info(
+            "All calibrated offsets are active."
+        )
+
+        if self.persist_offsets:
+            gcmd.respond_info(
+                "Offsets queued for SAVE_CONFIG -- press Save Config "
+                "in Mainsail/Fluidd to write them to printer.cfg "
+                "(this will restart the firmware)."
+            )
+        else:
+            gcmd.respond_info(
+                "persist_offsets is disabled; offsets are runtime-only."
+            )
+        gcmd.respond_info(
+            "Heaters have been turned off."
+        )
+        gcmd.respond_info(
+            "========================================"
+        )
 
     def cmd_STATUS(self, gcmd):
-        gcmd.respond_info("========================================")
-        gcmd.respond_info(" KTC CARTOGRAPHER Z STATUS")
-        gcmd.respond_info("========================================")
+        gcmd.respond_info(
+            "========================================"
+        )
+        gcmd.respond_info(
+            "KTC CARTOGRAPHER Z STATUS"
+        )
+        gcmd.respond_info(
+            "========================================"
+        )
+
         if self.last_reference_z is None:
-            gcmd.respond_info("No calibration reference available.")
-        else:
-            gcmd.respond_info("Reference T%d raw result: %.6f" % (self.reference_tool, self.last_reference_z))
-        gcmd.respond_info("Reference tool: T%d" % self.reference_tool)
-        gcmd.respond_info("Last run: %s" % ("SUCCESS" if self.last_run_success else "FAILED / NONE"))
-        gcmd.respond_info("Running: %s" % ("YES" if self.running else "NO"))
-        for tool_no in sorted(self.last_results):
-            r = self.last_results[tool_no]
             gcmd.respond_info(
-                "T%d: contact=%.6f delta=%+.6f offset=%+.6f"
-                % (tool_no, r["measured_z"], r["delta"], r["offset"])
+                "No calibration reference available."
             )
-        gcmd.respond_info("========================================")
+        else:
+            gcmd.respond_info(
+                "T%d reference: %.6f"
+                % (
+                    self.reference_tool,
+                    self.last_reference_z
+                )
+            )
+
+        gcmd.respond_info(
+            "Last run: %s"
+            % (
+                "SUCCESS"
+                if self.last_run_success
+                else "FAILED / NONE"
+            )
+        )
+
+        gcmd.respond_info(
+            "Running: %s"
+            % (
+                "YES"
+                if self.running
+                else "NO"
+            )
+        )
+
+        for tool in sorted(self.last_results):
+            result = self.last_results[tool]
+
+            gcmd.respond_info(
+                "T%d: contact=%.6f "
+                "delta=%+.6f "
+                "offset=%+.6f"
+                % (
+                    tool,
+                    result["measured_z"],
+                    result["delta"],
+                    result["offset"]
+                )
+            )
+
+        gcmd.respond_info(
+            "========================================"
+        )
 
     def get_status(self, eventtime):
         return {
@@ -546,7 +1108,10 @@ class KTCCartographerZCalibrate:
             "success": self.last_run_success,
             "reference_tool": self.reference_tool,
             "reference_z": self.last_reference_z,
-            "results": {str(k): dict(v) for k, v in self.last_results.items()},
+            "results": {
+                str(tool): dict(result)
+                for tool, result in self.last_results.items()
+            }
         }
 
 
