@@ -1,3 +1,5 @@
+USE AT YOUR OWN RISK
+
 # KTC Cartographer Z Calibration
 
 Standalone Klipper extra for automatic multi-tool Z-offset calibration using Cartographer Touch.
