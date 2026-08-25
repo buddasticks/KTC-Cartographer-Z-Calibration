@@ -26,15 +26,15 @@ Add the supplied configuration to `printer.cfg` or another included cfg file:
 [include ktc_cartographer_z_calibrate.cfg]
 ```
 
-Optionally, if you want a nozzle wipe before each probe touch, also include a wipe macro:
+Optionally, if you want a nozzle wipe before each probe touch, also include the wipe macro:
 
 ```text
-wipe_gcode: WIPE_NOZZLE
+[include wipe_nozzle.cfg]
 ```
 
 ## Default configuration
 
-The supplied config assumes:
+The supplied config assumes 4 tools:
 
 ```text
 T0 -> extruder
@@ -44,7 +44,12 @@ T3 -> extruder3
 Bed -> heater_bed
 ```
 
-Change the `toolN_heater` settings if your printer uses different heater names.
+If you have more or fewer tools, set `tool_count` accordingly and add/remove
+`toolN_heater` entries — heater names default to `extruderN` (and `extruder`
+for T0) if not given explicitly. The tool list actually calibrated is normally
+read straight from the toolchanger; `tool_count` mainly controls how many
+heater entries get built and is the fallback if the toolchanger doesn't report
+its own tool list.
 
 ## Use
 
